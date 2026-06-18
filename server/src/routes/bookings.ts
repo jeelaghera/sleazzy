@@ -1,0 +1,134 @@
+import express from 'express';
+// 1. Swap Supabase for your new database pool
+import { db } from '../db'; 
+import authMiddleware from '../middleware/auth';
+import { createBooking, checkConflict } from '../controllers/bookingController';
+import { getSemesterRange, countCoCurricularBookings, CO_CURRICULAR_LIMIT } from '../services/semesterUtils';
+
+const router = express.Router();
+
+router.get('/venues', async (_req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM venues');
+    return res.json(rows);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/clubs', async (_req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM clubs');
+    return res.json(rows);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/my-bookings', authMiddleware, async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    //  Find the club associated with this user's email
+    const clubResult = await db.query(
+      'SELECT id FROM clubs WHERE email = $1 LIMIT 1',
+      [req.user.email]
+    );
+
+    const queryStr = `
+      SELECT b.*, 
+             json_build_object('name', c.name) AS clubs,
+             json_build_object('name', v.name) AS venues
+      FROM bookings b
+      LEFT JOIN clubs c ON b.club_id = c.id
+      LEFT JOIN venues v ON b.venue_id = v.id
+      WHERE $1 = $2
+      ORDER BY b.start_time DESC
+    `;
+
+    if (clubResult.rows.length === 0) {
+      // Fallback: if no club found, fetch by user_id
+      const { rows } = await db.query(
+        queryStr.replace('$1 = $2', 'b.user_id = $1'), 
+        [req.user.id]
+      );
+      return res.json(rows);
+    }
+
+    // Fetch all bookings for this club
+    const club = clubResult.rows[0];
+    const { rows } = await db.query(
+      queryStr.replace('$1 = $2', 'b.club_id = $1'), 
+      [club.id]
+    );
+    
+    return res.json(rows);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/bookings/check-conflict', checkConflict);
+
+import { getBusyVenues } from '../controllers/bookingController';
+router.get('/busy-venues', getBusyVenues);
+
+router.post('/bookings', authMiddleware, createBooking);
+
+router.get('/public-bookings', async (_req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT b.*, 
+             json_build_object('name', c.name) AS clubs,
+             json_build_object('name', v.name) AS venues
+      FROM bookings b
+      LEFT JOIN clubs c ON b.club_id = c.id
+      LEFT JOIN venues v ON b.venue_id = v.id
+      WHERE b.status = 'approved'
+        AND b.end_time >= NOW()
+        AND b.event_type IS DISTINCT FROM 'closed_club'
+      ORDER BY b.start_time ASC
+    `);
+    
+    return res.json(rows);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/campus-bookings', authMiddleware, async (_req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT b.*, 
+             json_build_object('name', c.name) AS clubs,
+             json_build_object('name', v.name) AS venues
+      FROM bookings b
+      LEFT JOIN clubs c ON b.club_id = c.id
+      LEFT JOIN venues v ON b.venue_id = v.id
+      WHERE b.status = 'approved' AND b.end_time >= NOW()
+      ORDER BY b.start_time ASC
+    `);
+
+    return res.json(rows);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Returns the co-curricular booking count for a club in the current semester
+router.get('/bookings/co-curricular-count', authMiddleware, async (req, res) => {
+  const clubId = req.query.clubId as string;
+  if (!clubId) {
+    return res.status(400).json({ error: 'clubId is required' });
+  }
+
+  try {
+    const { start, end } = getSemesterRange(new Date());
+    const count = await countCoCurricularBookings(clubId, start, end);
+    return res.json({ count, limit: CO_CURRICULAR_LIMIT });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+export default router;
